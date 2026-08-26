@@ -13,22 +13,39 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+
     steps:
       - name: Récupérer le dépôt
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Installer Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: requirements-dev.txt
 
+      - name: Vérifier les fichiers indispensables
+        shell: bash
+        run: |
+          pwd
+          ls -la
+          test -f news_publisher.py || { echo "ERREUR: news_publisher.py absent de la racine du dépôt"; exit 1; }
+          test -f main3.py || { echo "ERREUR: main3.py absent de la racine du dépôt"; exit 1; }
+          test -d tests || { echo "ERREUR: dossier tests absent"; exit 1; }
+
       - name: Installer les dépendances de test
         run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
+
+      - name: Vérifier les imports du projet
+        run: |
+          python -c "import news_publisher; print('OK import news_publisher')"
+          python -c "import main3; print('OK import main3')"
 
       - name: Vérifier la syntaxe
         run: python -m compileall -q .
 
       - name: Lancer les tests
-        run: pytest -q
+        run: python -m pytest -q

@@ -153,3 +153,7 @@ Les workflows football et cinéma ne publient **jamais** un article sans vraie i
 Si aucune image exploitable n'est trouvée, l'article est ignoré et le moteur essaie l'article suivant. Si aucun nouvel article avec image n'est disponible, aucune publication n'est envoyée. **Aucune image de secours n'est générée.**
 
 Les images web existantes peuvent être normalisées en JPEG avant l'envoi afin d'éviter les formats, dimensions ou poids qui provoquent des erreurs Telegram.
+
+## Correction CI / imports Pytest
+
+Le workflow de vérification définit explicitement la racine du dépôt dans `PYTHONPATH`, vérifie la présence de `news_publisher.py` et `main3.py`, puis lance les tests avec `python -m pytest -q`. Le fichier `pytest.ini` et `tests/conftest.py` garantissent également que les modules placés à la racine restent importables quel que soit le mode de lancement de Pytest.
