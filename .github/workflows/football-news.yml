@@ -1,0 +1,63 @@
+name: Actualités football
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"
+      timezone: "Africa/Lome"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Ignorer l'historique et forcer une publication"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: actu-poster-football
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      FOOTBALL_BOT_TOKEN: ${{ secrets.FOOTBALL_BOT_TOKEN }}
+      FOOTBALL_CHANNEL_ID: ${{ secrets.FOOTBALL_CHANNEL_ID }}
+      FORCE_RUN: ${{ inputs.force || 'false' }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v7
+
+      - name: Installer Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Restaurer l'historique anti-doublon
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: actu-poster-football-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            actu-poster-football-
+
+      - name: Installer les dépendances
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Publier une actualité football
+        run: python main.py
+
+      - name: Sauvegarder l'historique anti-doublon
+        if: ${{ always() }}
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: actu-poster-football-${{ github.run_id }}-${{ github.run_attempt }}

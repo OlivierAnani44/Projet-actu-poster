@@ -1,0 +1,6 @@
+aiohttp==3.14.3
+deep-translator==1.11.4
+feedparser==6.0.14
+openai==2.54.0
+python-telegram-bot==22.8
+requests==2.34.2
