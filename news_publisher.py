@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import html
+import io
 import json
 import logging
 import os
@@ -16,12 +17,15 @@ import random
 import re
 import tempfile
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+from urllib.parse import urljoin
 
 import aiohttp
 import feedparser
 from deep_translator import GoogleTranslator
+from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 from telegram import Bot
 from telegram.request import HTTPXRequest
 
@@ -40,6 +44,10 @@ TELEGRAM_WRITE_TIMEOUT = float(os.getenv("TELEGRAM_WRITE_TIMEOUT", "60"))
 TELEGRAM_MEDIA_WRITE_TIMEOUT = float(os.getenv("TELEGRAM_MEDIA_WRITE_TIMEOUT", "90"))
 TELEGRAM_POOL_TIMEOUT = float(os.getenv("TELEGRAM_POOL_TIMEOUT", "10"))
 MAX_TELEGRAM_PHOTO_BYTES = 9_500_000
+MAX_ARTICLE_HTML_BYTES = 2_000_000
+MIN_IMAGE_WIDTH = 320
+MIN_IMAGE_HEIGHT = 180
+NORMALIZED_IMAGE_MAX_SIDE = 1920
 
 
 @dataclass(frozen=True)
@@ -58,6 +66,8 @@ class FeedConfig:
     channels_env: str
     legacy_channels_env: str | None = None
     translate_content: bool = True
+    ensure_image: bool = False
+    image_label: str | None = None
 
 
 def configure_logging() -> None:
@@ -224,17 +234,125 @@ def select_most_important(
     return max(candidates, key=lambda entry: compute_importance(entry, keyword_weights))
 
 
+def _append_unique_url(target: list[str], value: Any, *, base_url: str | None = None) -> None:
+    """Ajoute une URL d'image plausible sans doublon."""
+
+    if not isinstance(value, str):
+        return
+    candidate = html.unescape(value).strip()
+    if not candidate or candidate.startswith("data:"):
+        return
+    if base_url:
+        candidate = urljoin(base_url, candidate)
+    if candidate.startswith(("http://", "https://")) and candidate not in target:
+        target.append(candidate)
+
+
+def extract_image_candidates(entry: Mapping[str, Any]) -> list[str]:
+    """Collecte toutes les images exposées directement par le RSS."""
+
+    candidates: list[str] = []
+
+    for key in ("media_content", "media_thumbnail"):
+        media = entry.get(key)
+        if isinstance(media, list):
+            for item in media:
+                if isinstance(item, Mapping):
+                    _append_unique_url(candidates, item.get("url"))
+
+    for key in ("enclosures", "links"):
+        values = entry.get(key)
+        if not isinstance(values, list):
+            continue
+        for item in values:
+            if not isinstance(item, Mapping):
+                continue
+            content_type = str(item.get("type", "")).lower()
+            rel = str(item.get("rel", "")).lower()
+            if content_type.startswith("image/") or rel in {"enclosure", "image", "thumbnail"}:
+                _append_unique_url(candidates, item.get("href") or item.get("url"))
+
+    html_fragments = [str(entry.get("summary", ""))]
+    content = entry.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, Mapping):
+                html_fragments.append(str(item.get("value", "")))
+
+    for fragment in html_fragments:
+        for match in re.finditer(r'<img[^>]+src=["\']([^"\']+)', fragment, flags=re.IGNORECASE):
+            _append_unique_url(candidates, match.group(1))
+
+    return candidates
+
+
 def extract_image(entry: Mapping[str, Any]) -> str | None:
-    media_content = entry.get("media_content")
-    if media_content and isinstance(media_content, list):
-        return media_content[0].get("url")
+    """Compatibilité avec l'ancienne API: renvoie la première image RSS."""
 
-    media_thumbnail = entry.get("media_thumbnail")
-    if media_thumbnail and isinstance(media_thumbnail, list):
-        return media_thumbnail[0].get("url")
+    candidates = extract_image_candidates(entry)
+    return candidates[0] if candidates else None
 
-    match = re.search(r'<img[^>]+src=["\']([^"\']+)', str(entry.get("summary", "")))
-    return match.group(1) if match else None
+
+class ArticleImageParser(HTMLParser):
+    """Extrait les images sociales (OpenGraph/Twitter) d'une page d'article."""
+
+    META_KEYS = {
+        "og:image",
+        "og:image:url",
+        "og:image:secure_url",
+        "twitter:image",
+        "twitter:image:src",
+    }
+
+    def __init__(self, base_url: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self.base_url = base_url
+        self.images: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = {str(key).lower(): value for key, value in attrs if key}
+
+        if tag.lower() == "meta":
+            key = str(values.get("property") or values.get("name") or "").lower()
+            if key in self.META_KEYS:
+                _append_unique_url(self.images, values.get("content"), base_url=self.base_url)
+
+        elif tag.lower() == "link":
+            rel = str(values.get("rel") or "").lower()
+            if "image_src" in rel or rel == "preload" and str(values.get("as") or "").lower() == "image":
+                _append_unique_url(self.images, values.get("href"), base_url=self.base_url)
+
+
+async def fetch_article_image_candidates(article_url: str | None) -> list[str]:
+    """Va chercher og:image/twitter:image lorsque le RSS ne donne pas de photo."""
+
+    if not article_url or not article_url.startswith(("http://", "https://")):
+        return []
+
+    timeout = aiohttp.ClientTimeout(total=30)
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml",
+    }
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(article_url, allow_redirects=True) as response:
+                response.raise_for_status()
+                content_type = response.headers.get("Content-Type", "").lower()
+                if content_type and "html" not in content_type:
+                    return []
+                payload = await response.content.read(MAX_ARTICLE_HTML_BYTES + 1)
+                if len(payload) > MAX_ARTICLE_HTML_BYTES:
+                    payload = payload[:MAX_ARTICLE_HTML_BYTES]
+                charset = response.charset or "utf-8"
+                page_url = str(response.url)
+
+        parser = ArticleImageParser(page_url)
+        parser.feed(payload.decode(charset, errors="replace"))
+        return parser.images
+    except Exception as exc:
+        LOGGER.warning("Impossible d'extraire l'image de l'article %s: %s", article_url, exc)
+        return []
 
 
 async def fetch_entries(url: str) -> list[Mapping[str, Any]]:
@@ -299,30 +417,143 @@ async def translate_to_french(value: str) -> str:
         return source
 
 
+def _load_font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
+    candidates = (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSansCondensed-Bold.ttf" if bold else "/usr/share/fonts/dejavu/DejaVuSansCondensed.ttf",
+    )
+    for font_path in candidates:
+        try:
+            return ImageFont.truetype(font_path, size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:
+    words = clean_text(text).split()
+    if not words:
+        return []
+    lines: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        box = draw.textbbox((0, 0), candidate, font=font)
+        if box[2] - box[0] <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def normalize_image_payload(payload: bytes) -> Path | None:
+    """Convertit une image web en JPEG fiable pour Telegram."""
+
+    if not payload:
+        return None
+    try:
+        with Image.open(io.BytesIO(payload)) as source:
+            source.seek(0)
+            image = ImageOps.exif_transpose(source).convert("RGB")
+            width, height = image.size
+            if width < MIN_IMAGE_WIDTH or height < MIN_IMAGE_HEIGHT:
+                raise RuntimeError(f"image trop petite: {width}x{height}")
+            image.thumbnail((NORMALIZED_IMAGE_MAX_SIDE, NORMALIZED_IMAGE_MAX_SIDE), Image.Resampling.LANCZOS)
+
+            with tempfile.NamedTemporaryFile(prefix="actu-poster-", suffix=".jpg", delete=False) as handle:
+                output = Path(handle.name)
+            image.save(output, format="JPEG", quality=88, optimize=True, progressive=True)
+            return output
+    except (UnidentifiedImageError, OSError, RuntimeError) as exc:
+        LOGGER.warning("Image web rejetée: %s", exc)
+        return None
+
+
 async def download_image(url: str | None) -> Path | None:
     if not url:
         return None
 
-    timeout = aiohttp.ClientTimeout(total=30)
-    headers = {"User-Agent": USER_AGENT}
+    timeout = aiohttp.ClientTimeout(total=35)
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    }
     try:
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(url) as response:
+            async with session.get(url, allow_redirects=True) as response:
                 response.raise_for_status()
-                content_type = response.headers.get("Content-Type", "")
+                content_type = response.headers.get("Content-Type", "").lower()
                 if content_type and not content_type.startswith("image/"):
                     raise RuntimeError(f"type inattendu: {content_type}")
                 payload = await response.read()
-
-        if not payload:
-            return None
-
-        with tempfile.NamedTemporaryFile(prefix="actu-poster-", suffix=".jpg", delete=False) as handle:
-            handle.write(payload)
-            return Path(handle.name)
+        return normalize_image_payload(payload)
     except Exception as exc:
-        LOGGER.warning("Image indisponible: %s", exc)
+        LOGGER.warning("Image indisponible (%s): %s", url, exc)
         return None
+
+
+def create_fallback_image(config: FeedConfig, title: str) -> Path:
+    """Crée une carte visuelle liée à l'article si aucune photo source n'est exploitable."""
+
+    width, height = 1280, 720
+    image = Image.new("RGB", (width, height), (14, 28, 42))
+    draw = ImageDraw.Draw(image)
+
+    # Bandeau et lignes de terrain discrètes: visuel neutre, sans fausse photo.
+    draw.rectangle((0, 0, width, 112), fill=(18, 57, 82))
+    draw.line((70, 610, 1210, 610), fill=(45, 96, 118), width=3)
+    draw.ellipse((1010, 430, 1190, 610), outline=(45, 96, 118), width=3)
+    draw.line((1100, 430, 1100, 610), fill=(45, 96, 118), width=3)
+
+    label = clean_text(config.image_label or config.name.upper())
+    label_font = _load_font(38, bold=True)
+    title_font = _load_font(56, bold=True)
+    small_font = _load_font(28)
+    draw.text((70, 34), label, font=label_font, fill=(255, 255, 255))
+
+    lines = _wrap_text(draw, truncate(title, 180), title_font, 1080)[:4]
+    y = 190
+    for line in lines:
+        draw.text((70, y), line, font=title_font, fill=(245, 248, 250))
+        y += 76
+
+    draw.text((70, 650), "Actualité sélectionnée automatiquement", font=small_font, fill=(169, 197, 212))
+
+    with tempfile.NamedTemporaryFile(prefix="actu-poster-fallback-", suffix=".jpg", delete=False) as handle:
+        output = Path(handle.name)
+    image.save(output, format="JPEG", quality=90, optimize=True, progressive=True)
+    return output
+
+
+async def resolve_image(config: FeedConfig, entry: Mapping[str, Any], title: str) -> Path | None:
+    """RSS → page article (og:image) → carte générée, dans cet ordre."""
+
+    candidates = extract_image_candidates(entry)
+    LOGGER.info("Images trouvées dans le RSS: %d.", len(candidates))
+
+    for url in candidates:
+        path = await download_image(url)
+        if path:
+            LOGGER.info("Image retenue depuis le RSS: %s", url)
+            return path
+
+    article_url = str(entry.get("link") or "").strip()
+    page_candidates = await fetch_article_image_candidates(article_url)
+    LOGGER.info("Images trouvées sur la page article: %d.", len(page_candidates))
+    for url in page_candidates:
+        if url in candidates:
+            continue
+        path = await download_image(url)
+        if path:
+            LOGGER.info("Image retenue depuis la page article: %s", url)
+            return path
+
+    if config.ensure_image:
+        LOGGER.warning("Aucune photo source exploitable: génération d'une carte de secours.")
+        return create_fallback_image(config, title)
+    return None
 
 
 def format_message(config: FeedConfig, title: str, summary: str) -> str:
@@ -392,7 +623,11 @@ async def publish_once(config: FeedConfig, *, dry_run: bool = False, force: bool
         print(message)
         return True
 
-    image_path = await download_image(extract_image(selected))
+    image_path = await resolve_image(config, selected, title)
+    if config.ensure_image and not image_path:
+        raise RuntimeError(
+            f"Aucune image n'a pu être préparée pour {config.name}; publication annulée."
+        )
     if image_path:
         try:
             image_size = image_path.stat().st_size

@@ -1,8 +1,11 @@
 from pathlib import Path
 
 from news_publisher import (
+    ArticleImageParser,
     FeedConfig,
     PostedState,
+    create_fallback_image,
+    extract_image_candidates,
     format_message,
     select_most_important,
     translation_is_error,
@@ -80,3 +83,36 @@ def test_translation_error_page_is_rejected() -> None:
         "There was an error. Please try again later."
     )
     assert not translation_is_error("Le Real Madrid annonce une nouvelle recrue")
+
+
+def test_rss_image_candidates_are_collected_without_duplicates() -> None:
+    entry = {
+        "media_content": [{"url": "https://img.test/photo.jpg"}],
+        "media_thumbnail": [{"url": "https://img.test/photo.jpg"}],
+        "links": [{"rel": "enclosure", "type": "image/jpeg", "href": "https://img.test/second.jpg"}],
+        "summary": '<p><img src="https://img.test/third.jpg"></p>',
+    }
+
+    assert extract_image_candidates(entry) == [
+        "https://img.test/photo.jpg",
+        "https://img.test/second.jpg",
+        "https://img.test/third.jpg",
+    ]
+
+
+def test_article_parser_finds_open_graph_image() -> None:
+    parser = ArticleImageParser("https://example.test/news/123")
+    parser.feed(
+        '<html><head><meta property="og:image" content="/media/article.jpg"></head></html>'
+    )
+    assert parser.images == ["https://example.test/media/article.jpg"]
+
+
+def test_fallback_image_is_created(tmp_path: Path) -> None:
+    config = sample_config(tmp_path / "state.json")
+    path = create_fallback_image(config, "Un grand match se prépare ce soir")
+    try:
+        assert path.exists()
+        assert path.stat().st_size > 5_000
+    finally:
+        path.unlink(missing_ok=True)

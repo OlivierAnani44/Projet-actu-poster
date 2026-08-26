@@ -11,6 +11,8 @@ CONFIG = FeedConfig(
     channels_env="FOOTBALL_CHANNEL_ID",
     legacy_channels_env="FOOTBALL_CHANNELS",
     translate_content=False,
+    ensure_image=True,
+    image_label="ACTU FOOT",
     emoji="🔥🔥",
     title_variants=(
         "NOUVELLE FOOT", "INFO FOOT", "ACTUALITÉ FOOT", "FLASH FOOT",
