@@ -4,7 +4,6 @@ from news_publisher import (
     ArticleImageParser,
     FeedConfig,
     PostedState,
-    create_fallback_image,
     extract_image_candidates,
     format_message,
     select_most_important,
@@ -106,13 +105,3 @@ def test_article_parser_finds_open_graph_image() -> None:
         '<html><head><meta property="og:image" content="/media/article.jpg"></head></html>'
     )
     assert parser.images == ["https://example.test/media/article.jpg"]
-
-
-def test_fallback_image_is_created(tmp_path: Path) -> None:
-    config = sample_config(tmp_path / "state.json")
-    path = create_fallback_image(config, "Un grand match se prépare ce soir")
-    try:
-        assert path.exists()
-        assert path.stat().st_size > 5_000
-    finally:
-        path.unlink(missing_ok=True)

@@ -144,11 +144,12 @@ d'utiliser ce dépôt.
 
 Le bot football utilise désormais un flux RSS francophone (Foot Mercato) et ne dépend plus de Google Translate pour ses publications. Le moteur commun détecte aussi les réponses du type `Error 500 / Server Error / Please try again later` et refuse de les publier sur Telegram. Le flux cinéma Allociné étant déjà en français, sa traduction automatique est également désactivée.
 
-## Images des actualités football
+## Images obligatoires pour les actualités
 
-Le workflow football ne publie plus de post sans image. L'ordre de recherche est :
+Les workflows football et cinéma ne publient **jamais** un article sans vraie image source. L'ordre de recherche est :
 1. image fournie directement par le flux RSS ;
-2. image OpenGraph/Twitter (`og:image`, `twitter:image`) de la page de l'article ;
-3. carte ACTU FOOT générée automatiquement avec le titre de l'article si aucune photo source n'est exploitable.
+2. image OpenGraph/Twitter (`og:image`, `twitter:image`) de la page de l'article.
 
-Les images web sont normalisées en JPEG avant l'envoi afin d'éviter les formats, dimensions ou poids qui provoquent des erreurs Telegram.
+Si aucune image exploitable n'est trouvée, l'article est ignoré et le moteur essaie l'article suivant. Si aucun nouvel article avec image n'est disponible, aucune publication n'est envoyée. **Aucune image de secours n'est générée.**
+
+Les images web existantes peuvent être normalisées en JPEG avant l'envoi afin d'éviter les formats, dimensions ou poids qui provoquent des erreurs Telegram.

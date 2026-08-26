@@ -25,7 +25,7 @@ from urllib.parse import urljoin
 import aiohttp
 import feedparser
 from deep_translator import GoogleTranslator
-from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 from telegram import Bot
 from telegram.request import HTTPXRequest
 
@@ -67,7 +67,6 @@ class FeedConfig:
     legacy_channels_env: str | None = None
     translate_content: bool = True
     ensure_image: bool = False
-    image_label: str | None = None
 
 
 def configure_logging() -> None:
@@ -219,19 +218,32 @@ def compute_importance(entry: Mapping[str, Any], keyword_weights: Mapping[str, i
     return score
 
 
-def select_most_important(
+def rank_candidates(
     entries: Iterable[Mapping[str, Any]],
     state: PostedState,
     keyword_weights: Mapping[str, int],
-) -> Mapping[str, Any] | None:
+) -> list[Mapping[str, Any]]:
+    """Trie les articles non encore publiés par importance décroissante."""
+
     candidates = [
         entry
         for entry in entries
         if entry_identifier(entry) and state.unseen_by_any(entry_identifier(entry))
     ]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda entry: compute_importance(entry, keyword_weights))
+    return sorted(
+        candidates,
+        key=lambda entry: compute_importance(entry, keyword_weights),
+        reverse=True,
+    )
+
+
+def select_most_important(
+    entries: Iterable[Mapping[str, Any]],
+    state: PostedState,
+    keyword_weights: Mapping[str, int],
+) -> Mapping[str, Any] | None:
+    candidates = rank_candidates(entries, state, keyword_weights)
+    return candidates[0] if candidates else None
 
 
 def _append_unique_url(target: list[str], value: Any, *, base_url: str | None = None) -> None:
@@ -417,36 +429,6 @@ async def translate_to_french(value: str) -> str:
         return source
 
 
-def _load_font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
-    candidates = (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSansCondensed-Bold.ttf" if bold else "/usr/share/fonts/dejavu/DejaVuSansCondensed.ttf",
-    )
-    for font_path in candidates:
-        try:
-            return ImageFont.truetype(font_path, size=size)
-        except OSError:
-            continue
-    return ImageFont.load_default()
-
-
-def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:
-    words = clean_text(text).split()
-    if not words:
-        return []
-    lines: list[str] = []
-    current = words[0]
-    for word in words[1:]:
-        candidate = f"{current} {word}"
-        box = draw.textbbox((0, 0), candidate, font=font)
-        if box[2] - box[0] <= max_width:
-            current = candidate
-        else:
-            lines.append(current)
-            current = word
-    lines.append(current)
-    return lines
-
 
 def normalize_image_payload(payload: bytes) -> Path | None:
     """Convertit une image web en JPEG fiable pour Telegram."""
@@ -494,41 +476,9 @@ async def download_image(url: str | None) -> Path | None:
         return None
 
 
-def create_fallback_image(config: FeedConfig, title: str) -> Path:
-    """Crée une carte visuelle liée à l'article si aucune photo source n'est exploitable."""
-
-    width, height = 1280, 720
-    image = Image.new("RGB", (width, height), (14, 28, 42))
-    draw = ImageDraw.Draw(image)
-
-    # Bandeau et lignes de terrain discrètes: visuel neutre, sans fausse photo.
-    draw.rectangle((0, 0, width, 112), fill=(18, 57, 82))
-    draw.line((70, 610, 1210, 610), fill=(45, 96, 118), width=3)
-    draw.ellipse((1010, 430, 1190, 610), outline=(45, 96, 118), width=3)
-    draw.line((1100, 430, 1100, 610), fill=(45, 96, 118), width=3)
-
-    label = clean_text(config.image_label or config.name.upper())
-    label_font = _load_font(38, bold=True)
-    title_font = _load_font(56, bold=True)
-    small_font = _load_font(28)
-    draw.text((70, 34), label, font=label_font, fill=(255, 255, 255))
-
-    lines = _wrap_text(draw, truncate(title, 180), title_font, 1080)[:4]
-    y = 190
-    for line in lines:
-        draw.text((70, y), line, font=title_font, fill=(245, 248, 250))
-        y += 76
-
-    draw.text((70, 650), "Actualité sélectionnée automatiquement", font=small_font, fill=(169, 197, 212))
-
-    with tempfile.NamedTemporaryFile(prefix="actu-poster-fallback-", suffix=".jpg", delete=False) as handle:
-        output = Path(handle.name)
-    image.save(output, format="JPEG", quality=90, optimize=True, progressive=True)
-    return output
-
 
 async def resolve_image(config: FeedConfig, entry: Mapping[str, Any], title: str) -> Path | None:
-    """RSS → page article (og:image) → carte générée, dans cet ordre."""
+    """Cherche uniquement une vraie image source: RSS puis page de l'article."""
 
     candidates = extract_image_candidates(entry)
     LOGGER.info("Images trouvées dans le RSS: %d.", len(candidates))
@@ -550,10 +500,30 @@ async def resolve_image(config: FeedConfig, entry: Mapping[str, Any], title: str
             LOGGER.info("Image retenue depuis la page article: %s", url)
             return path
 
-    if config.ensure_image:
-        LOGGER.warning("Aucune photo source exploitable: génération d'une carte de secours.")
-        return create_fallback_image(config, title)
+    LOGGER.warning(
+        "Aucune photo source exploitable pour cet article: publication interdite sans image."
+    )
     return None
+
+
+def image_is_sendable(image_path: Path | None) -> bool:
+    """Vérifie qu'une image existe et reste dans une taille raisonnable pour Telegram."""
+
+    if not image_path:
+        return False
+    try:
+        image_size = image_path.stat().st_size
+        LOGGER.info("Image téléchargée: %.2f Mo.", image_size / (1024 * 1024))
+        if image_size > MAX_TELEGRAM_PHOTO_BYTES:
+            LOGGER.warning(
+                "Image trop lourde pour un envoi photo fiable (%.2f Mo).",
+                image_size / (1024 * 1024),
+            )
+            return False
+        return True
+    except OSError as exc:
+        LOGGER.warning("Impossible de lire la taille de l'image: %s", exc)
+        return False
 
 
 def format_message(config: FeedConfig, title: str, summary: str) -> str:
@@ -593,55 +563,76 @@ async def publish_once(config: FeedConfig, *, dry_run: bool = False, force: bool
         state = PostedState(config.state_file, channels)
 
     entries = await fetch_entries(config.rss_feed)
-    selected = select_most_important(entries, state, config.keyword_weights)
-    if selected is None:
+    candidates = rank_candidates(entries, state, config.keyword_weights)
+    if not candidates:
         LOGGER.info("Aucun nouvel article %s à publier.", config.name)
         return False
 
-    item_id = entry_identifier(selected)
-    raw_title = str(selected.get("title", ""))
-    raw_summary = str(selected.get("summary", ""))
+    selected: Mapping[str, Any] | None = None
+    item_id = ""
+    title = ""
+    summary = ""
+    message = ""
+    image_path: Path | None = None
 
-    if config.translate_content:
-        title, summary = await asyncio.gather(
-            translate_to_french(raw_title),
-            translate_to_french(raw_summary),
-        )
-    else:
-        title = clean_text(raw_title)
-        summary = clean_text(raw_summary)
+    for candidate in candidates:
+        candidate_id = entry_identifier(candidate)
+        raw_title = str(candidate.get("title", ""))
+        raw_summary = str(candidate.get("summary", ""))
 
-    # Dernière barrière: un message d'erreur externe ne doit jamais être posté.
-    if translation_is_error(title) or translation_is_error(summary):
-        raise RuntimeError(
-            "Article ignoré: le titre ou le résumé ressemble à une erreur HTTP externe."
-        )
+        if config.translate_content:
+            candidate_title, candidate_summary = await asyncio.gather(
+                translate_to_french(raw_title),
+                translate_to_french(raw_summary),
+            )
+        else:
+            candidate_title = clean_text(raw_title)
+            candidate_summary = clean_text(raw_summary)
 
-    message = format_message(config, title, summary)
+        if translation_is_error(candidate_title) or translation_is_error(candidate_summary):
+            LOGGER.warning("Article ignoré: contenu externe invalide ou erreur HTTP détectée.")
+            continue
 
-    if dry_run:
-        print(message)
-        return True
+        candidate_message = format_message(config, candidate_title, candidate_summary)
 
-    image_path = await resolve_image(config, selected, title)
-    if config.ensure_image and not image_path:
-        raise RuntimeError(
-            f"Aucune image n'a pu être préparée pour {config.name}; publication annulée."
-        )
-    if image_path:
-        try:
-            image_size = image_path.stat().st_size
-            LOGGER.info("Image téléchargée: %.2f Mo.", image_size / (1024 * 1024))
-            if image_size > MAX_TELEGRAM_PHOTO_BYTES:
-                LOGGER.warning(
-                    "Image trop lourde pour un envoi photo fiable (%.2f Mo); "
-                    "publication du texte uniquement.",
-                    image_size / (1024 * 1024),
+        if dry_run:
+            print(candidate_message)
+            return True
+
+        candidate_image = await resolve_image(config, candidate, candidate_title)
+        if config.ensure_image and not candidate_image:
+            LOGGER.info(
+                "Article ignoré car aucune image source exploitable n'a été trouvée: %s",
+                truncate(candidate_title, 120),
+            )
+            continue
+        if candidate_image and not image_is_sendable(candidate_image):
+            candidate_image.unlink(missing_ok=True)
+            candidate_image = None
+            if config.ensure_image:
+                LOGGER.info(
+                    "Article ignoré car l'image n'est pas envoyable sur Telegram: %s",
+                    truncate(candidate_title, 120),
                 )
-                image_path.unlink(missing_ok=True)
-                image_path = None
-        except OSError as exc:
-            LOGGER.warning("Impossible de lire la taille de l'image: %s", exc)
+                continue
+
+        selected = candidate
+        item_id = candidate_id
+        title = candidate_title
+        summary = candidate_summary
+        message = candidate_message
+        image_path = candidate_image
+        break
+
+    if selected is None:
+        LOGGER.info(
+            "Aucun article %s publiable actuellement (image requise et aucune image source valide trouvée).",
+            config.name,
+        )
+        return False
+    if config.ensure_image and not image_path:
+        LOGGER.info("Publication annulée: aucune image exploitable n'est disponible.")
+        return False
 
     successes = 0
     failures: list[str] = []
@@ -676,6 +667,13 @@ async def publish_once(config: FeedConfig, *, dry_run: bool = False, force: bool
                 if state.has(channel, item_id):
                     continue
                 try:
+                    if config.ensure_image and not image_path:
+                        LOGGER.info(
+                            "Envoi ignoré sur %s: image obligatoire absente pour %s.",
+                            channel,
+                            config.name,
+                        )
+                        continue
                     if image_path:
                         with image_path.open("rb") as image_file:
                             await bot.send_photo(
