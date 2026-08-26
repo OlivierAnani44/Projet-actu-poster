@@ -10,6 +10,7 @@ CONFIG = FeedConfig(
     bot_token_env="CINEMA_BOT_TOKEN",
     channels_env="CINEMA_CHANNEL_ID",
     legacy_channels_env="CINEMA_CHANNELS",
+    translate_content=False,
     emoji="🎬🎥",
     title_variants=(
         "CINÉ INFO", "ACTU FILMS", "NEWS SÉRIES", "FLASH CINÉ",

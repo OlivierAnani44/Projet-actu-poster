@@ -56,6 +56,19 @@ suivants. Ils ont priorité sur `BOT_TOKEN` :
 Ne placez jamais une vraie clé dans `.env.example` ou directement dans un
 workflow YAML.
 
+### Diagnostic Telegram sans publier
+
+Un workflow manuel **Diagnostic Telegram** est fourni. Il vérifie les trois
+associations bot → canal avec `getMe` et `getChatMember`, sans envoyer de post.
+Dans **Actions → Diagnostic Telegram → Run workflow**, le journal indique aussi
+si le token réellement utilisé vient du secret spécialisé (`FOOTBALL_BOT_TOKEN`,
+`CINEMA_BOT_TOKEN`, `PREDICTIONS_BOT_TOKEN`) ou du `BOT_TOKEN` commun.
+
+Une erreur `Forbidden: bot is not a member of the channel chat` signifie que le
+bot correspondant au token actif doit être ajouté **à ce canal précis** comme
+administrateur avec le droit de publier, ou que le secret de canal/token pointe
+vers la mauvaise paire.
+
 ## Horaires livrés
 
 Les horaires utilisent le fuseau `Africa/Lome` :
@@ -125,3 +138,8 @@ Le projet d'origine contenait un `API_HASH` en clair et un fichier de session
 Telegram. Ils ne sont pas repris ici. Si ces éléments ont déjà été publiés ou
 partagés, révoquez la session depuis **Telegram → Paramètres → Appareils** avant
 d'utiliser ce dépôt.
+
+
+## Protection contre les erreurs de traduction
+
+Le bot football utilise désormais un flux RSS francophone (Foot Mercato) et ne dépend plus de Google Translate pour ses publications. Le moteur commun détecte aussi les réponses du type `Error 500 / Server Error / Please try again later` et refuse de les publier sur Telegram. Le flux cinéma Allociné étant déjà en français, sa traduction automatique est également désactivée.

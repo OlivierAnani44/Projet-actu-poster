@@ -1,0 +1,35 @@
+name: Diagnostic Telegram
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      FOOTBALL_BOT_TOKEN: ${{ secrets.FOOTBALL_BOT_TOKEN }}
+      CINEMA_BOT_TOKEN: ${{ secrets.CINEMA_BOT_TOKEN }}
+      PREDICTIONS_BOT_TOKEN: ${{ secrets.PREDICTIONS_BOT_TOKEN }}
+      FOOTBALL_CHANNEL_ID: ${{ secrets.FOOTBALL_CHANNEL_ID }}
+      CINEMA_CHANNEL_ID: ${{ secrets.CINEMA_CHANNEL_ID }}
+      PREDICTIONS_CHANNEL_ID: ${{ secrets.PREDICTIONS_CHANNEL_ID }}
+
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v7
+
+      - name: Installer Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Installer requests
+        run: python -m pip install --disable-pip-version-check requests
+
+      - name: Vérifier les bots et les canaux
+        run: python telegram_diagnostics.py

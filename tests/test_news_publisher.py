@@ -5,6 +5,7 @@ from news_publisher import (
     PostedState,
     format_message,
     select_most_important,
+    translation_is_error,
 )
 
 
@@ -71,3 +72,11 @@ def test_html_is_escaped_and_caption_stays_short(tmp_path: Path) -> None:
     assert "<p>" not in message
     assert len(message) < 1024
 
+
+
+def test_translation_error_page_is_rejected() -> None:
+    assert translation_is_error(
+        "Error 500 (Server Error)!!1 500. That's an error. "
+        "There was an error. Please try again later."
+    )
+    assert not translation_is_error("Le Real Madrid annonce une nouvelle recrue")

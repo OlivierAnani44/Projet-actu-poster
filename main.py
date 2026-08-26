@@ -5,11 +5,12 @@ from news_publisher import FeedConfig, run_cli
 
 CONFIG = FeedConfig(
     name="football",
-    rss_feed="https://feeds.bbci.co.uk/sport/football/rss.xml",
+    rss_feed="https://www.footmercato.net/flux-rss",
     state_file=".state/football.json",
     bot_token_env="FOOTBALL_BOT_TOKEN",
     channels_env="FOOTBALL_CHANNEL_ID",
     legacy_channels_env="FOOTBALL_CHANNELS",
+    translate_content=False,
     emoji="🔥🔥",
     title_variants=(
         "NOUVELLE FOOT", "INFO FOOT", "ACTUALITÉ FOOT", "FLASH FOOT",

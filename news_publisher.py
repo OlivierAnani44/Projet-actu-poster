@@ -23,12 +23,23 @@ import aiohttp
 import feedparser
 from deep_translator import GoogleTranslator
 from telegram import Bot
+from telegram.request import HTTPXRequest
 
 
 LOGGER = logging.getLogger("actu_poster.news")
 STATE_VERSION = 1
 MAX_STATE_ITEMS = 500
 USER_AGENT = "ActuPosterGitHubActions/1.0"
+
+# Les valeurs par défaut de python-telegram-bot sont courtes (notamment
+# 5 s pour attendre une réponse HTTP). Sur GitHub Actions, l'envoi d'une
+# photo peut régulièrement dépasser ce délai, même si Telegram fonctionne.
+TELEGRAM_CONNECT_TIMEOUT = float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "20"))
+TELEGRAM_READ_TIMEOUT = float(os.getenv("TELEGRAM_READ_TIMEOUT", "60"))
+TELEGRAM_WRITE_TIMEOUT = float(os.getenv("TELEGRAM_WRITE_TIMEOUT", "60"))
+TELEGRAM_MEDIA_WRITE_TIMEOUT = float(os.getenv("TELEGRAM_MEDIA_WRITE_TIMEOUT", "90"))
+TELEGRAM_POOL_TIMEOUT = float(os.getenv("TELEGRAM_POOL_TIMEOUT", "10"))
+MAX_TELEGRAM_PHOTO_BYTES = 9_500_000
 
 
 @dataclass(frozen=True)
@@ -46,6 +57,7 @@ class FeedConfig:
     bot_token_env: str
     channels_env: str
     legacy_channels_env: str | None = None
+    translate_content: bool = True
 
 
 def configure_logging() -> None:
@@ -59,6 +71,50 @@ def env_value(primary: str, fallback: str) -> str:
     """Lit une variable spécialisée, puis sa valeur commune de secours."""
 
     return (os.getenv(primary) or os.getenv(fallback) or "").strip()
+
+
+def env_value_with_source(primary: str, fallback: str) -> tuple[str, str]:
+    """Retourne la valeur et le nom de la variable réellement utilisée."""
+
+    primary_value = (os.getenv(primary) or "").strip()
+    if primary_value:
+        return primary_value, primary
+    fallback_value = (os.getenv(fallback) or "").strip()
+    if fallback_value:
+        return fallback_value, fallback
+    return "", primary
+
+
+def telegram_failure_hint(exc: Exception, *, bot_name: str, channel: str, token_source: str) -> str:
+    """Transforme les erreurs Telegram courantes en diagnostic exploitable."""
+
+    detail = str(exc)
+    lowered = detail.lower()
+    prefix = f"bot {bot_name} via {token_source} → {channel}"
+    if "bot is not a member of the channel chat" in lowered:
+        return (
+            f"{prefix}: le bot n'est pas membre du canal. "
+            "Ajoutez CE bot au canal comme administrateur avec le droit de publier, "
+            f"ou corrigez {token_source}/{channel}. Erreur Telegram: {detail}"
+        )
+    if "chat not found" in lowered:
+        return (
+            f"{prefix}: canal introuvable. Vérifiez l'identifiant du canal et assurez-vous "
+            f"que le bot y a accès. Erreur Telegram: {detail}"
+        )
+    if "not enough rights" in lowered or "not enough rights to send" in lowered:
+        return (
+            f"{prefix}: droits insuffisants. Donnez au bot le rôle administrateur et "
+            f"l'autorisation de publier. Erreur Telegram: {detail}"
+        )
+    if "timed out" in lowered or "timeout" in lowered:
+        return (
+            f"{prefix}: délai Telegram dépassé pendant l'envoi. "
+            f"Délais actifs: connexion={TELEGRAM_CONNECT_TIMEOUT:.0f}s, "
+            f"lecture={TELEGRAM_READ_TIMEOUT:.0f}s, média={TELEGRAM_MEDIA_WRITE_TIMEOUT:.0f}s. "
+            f"Erreur Telegram: {detail}"
+        )
+    return f"{prefix}: {detail}"
 
 
 def parse_channels(raw_value: str) -> list[str]:
@@ -197,18 +253,50 @@ async def fetch_entries(url: str) -> list[Mapping[str, Any]]:
     return entries
 
 
+def translation_is_error(value: str) -> bool:
+    """Détecte une page/message d'erreur renvoyé à la place d'une traduction."""
+
+    normalized = clean_text(value).lower()
+    if not normalized:
+        return True
+
+    error_markers = (
+        "error 500",
+        "server error",
+        "that's an error",
+        "thats an error",
+        "please try again later",
+        "service unavailable",
+        "too many requests",
+        "bad gateway",
+        "gateway timeout",
+        "captcha",
+    )
+    return any(marker in normalized for marker in error_markers)
+
+
 async def translate_to_french(value: str) -> str:
-    value = clean_text(value)
-    if not value:
-        return value
+    """Traduit vers le français sans jamais publier une page d'erreur Google."""
+
+    source = clean_text(value)
+    if not source:
+        return source
     try:
-        return await asyncio.to_thread(
+        translated = await asyncio.to_thread(
             GoogleTranslator(source="auto", target="fr").translate,
-            value,
+            source,
         )
+        translated = clean_text(str(translated or ""))
+        if translation_is_error(translated):
+            LOGGER.warning(
+                "Le service de traduction a renvoyé une erreur à la place du texte; "
+                "le contenu source est conservé."
+            )
+            return source
+        return translated
     except Exception as exc:  # La publication reste possible sans traduction.
         LOGGER.warning("Traduction indisponible: %s", exc)
-        return value
+        return source
 
 
 async def download_image(url: str | None) -> Path | None:
@@ -253,7 +341,7 @@ def format_message(config: FeedConfig, title: str, summary: str) -> str:
 async def publish_once(config: FeedConfig, *, dry_run: bool = False, force: bool = False) -> bool:
     """Publie au maximum un article, puis rend immédiatement la main."""
 
-    token = env_value(config.bot_token_env, "BOT_TOKEN")
+    token, token_source = env_value_with_source(config.bot_token_env, "BOT_TOKEN")
     channels_raw = (os.getenv(config.channels_env) or "").strip()
     if not channels_raw and config.legacy_channels_env:
         channels_raw = (os.getenv(config.legacy_channels_env) or "").strip()
@@ -280,10 +368,24 @@ async def publish_once(config: FeedConfig, *, dry_run: bool = False, force: bool
         return False
 
     item_id = entry_identifier(selected)
-    title, summary = await asyncio.gather(
-        translate_to_french(str(selected.get("title", ""))),
-        translate_to_french(str(selected.get("summary", ""))),
-    )
+    raw_title = str(selected.get("title", ""))
+    raw_summary = str(selected.get("summary", ""))
+
+    if config.translate_content:
+        title, summary = await asyncio.gather(
+            translate_to_french(raw_title),
+            translate_to_french(raw_summary),
+        )
+    else:
+        title = clean_text(raw_title)
+        summary = clean_text(raw_summary)
+
+    # Dernière barrière: un message d'erreur externe ne doit jamais être posté.
+    if translation_is_error(title) or translation_is_error(summary):
+        raise RuntimeError(
+            "Article ignoré: le titre ou le résumé ressemble à une erreur HTTP externe."
+        )
+
     message = format_message(config, title, summary)
 
     if dry_run:
@@ -291,11 +393,50 @@ async def publish_once(config: FeedConfig, *, dry_run: bool = False, force: bool
         return True
 
     image_path = await download_image(extract_image(selected))
+    if image_path:
+        try:
+            image_size = image_path.stat().st_size
+            LOGGER.info("Image téléchargée: %.2f Mo.", image_size / (1024 * 1024))
+            if image_size > MAX_TELEGRAM_PHOTO_BYTES:
+                LOGGER.warning(
+                    "Image trop lourde pour un envoi photo fiable (%.2f Mo); "
+                    "publication du texte uniquement.",
+                    image_size / (1024 * 1024),
+                )
+                image_path.unlink(missing_ok=True)
+                image_path = None
+        except OSError as exc:
+            LOGGER.warning("Impossible de lire la taille de l'image: %s", exc)
+
     successes = 0
     failures: list[str] = []
 
+    # Les timeouts par défaut de PTB sont trop courts pour certains uploads
+    # depuis GitHub Actions. On utilise une requête HTTP dédiée, avec un délai
+    # plus confortable pour les photos et pour la réponse de Telegram.
+    request = HTTPXRequest(
+        connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
+        read_timeout=TELEGRAM_READ_TIMEOUT,
+        write_timeout=TELEGRAM_WRITE_TIMEOUT,
+        media_write_timeout=TELEGRAM_MEDIA_WRITE_TIMEOUT,
+        pool_timeout=TELEGRAM_POOL_TIMEOUT,
+    )
+
     try:
-        async with Bot(token=token) as bot:
+        async with Bot(token=token, request=request) as bot:
+            me = await bot.get_me(
+                connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
+                read_timeout=TELEGRAM_READ_TIMEOUT,
+                write_timeout=TELEGRAM_WRITE_TIMEOUT,
+                pool_timeout=TELEGRAM_POOL_TIMEOUT,
+            )
+            bot_name = f"@{me.username}" if me.username else f"id={me.id}"
+            LOGGER.info(
+                "Bot Telegram actif pour %s: %s (secret %s).",
+                config.name,
+                bot_name,
+                token_source,
+            )
             for channel in channels:
                 if state.has(channel, item_id):
                     continue
@@ -307,6 +448,10 @@ async def publish_once(config: FeedConfig, *, dry_run: bool = False, force: bool
                                 photo=image_file,
                                 caption=message,
                                 parse_mode="HTML",
+                                connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
+                                read_timeout=TELEGRAM_READ_TIMEOUT,
+                                write_timeout=TELEGRAM_MEDIA_WRITE_TIMEOUT,
+                                pool_timeout=TELEGRAM_POOL_TIMEOUT,
                             )
                     else:
                         await bot.send_message(
@@ -314,13 +459,23 @@ async def publish_once(config: FeedConfig, *, dry_run: bool = False, force: bool
                             text=message,
                             parse_mode="HTML",
                             disable_web_page_preview=True,
+                            connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
+                            read_timeout=TELEGRAM_READ_TIMEOUT,
+                            write_timeout=TELEGRAM_WRITE_TIMEOUT,
+                            pool_timeout=TELEGRAM_POOL_TIMEOUT,
                         )
                     state.mark(channel, item_id)
                     successes += 1
                     LOGGER.info("Publication %s envoyée sur %s.", config.name, channel)
                 except Exception as exc:
-                    failures.append(f"{channel}: {exc}")
-                    LOGGER.error("Échec Telegram sur %s: %s", channel, exc)
+                    diagnostic = telegram_failure_hint(
+                        exc,
+                        bot_name=bot_name,
+                        channel=channel,
+                        token_source=token_source,
+                    )
+                    failures.append(diagnostic)
+                    LOGGER.error("Échec Telegram: %s", diagnostic)
     finally:
         if image_path:
             image_path.unlink(missing_ok=True)
