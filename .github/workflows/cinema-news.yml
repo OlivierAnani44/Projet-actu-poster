@@ -42,7 +42,7 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: Restaurer l'historique anti-doublon
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .state
           key: actu-poster-cinema-${{ github.run_id }}-${{ github.run_attempt }}
@@ -57,7 +57,7 @@ jobs:
 
       - name: Sauvegarder l'historique anti-doublon
         if: ${{ always() }}
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .state
           key: actu-poster-cinema-${{ github.run_id }}-${{ github.run_attempt }}
